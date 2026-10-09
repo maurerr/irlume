@@ -7264,6 +7264,16 @@ impl IrCamera {
 }
 
 /// A running IR stream with its emitter lit.
+#[cfg(feature = "t480-experimental")]
+pub(crate) fn is_qualified(
+    format_evidence_present: bool,
+    latch_clean: bool,
+    optical_observations: &[(u32, f32)],
+) -> bool {
+    let optical = ir_emitter::D1OpticalEvidence::from_sequence_means(optical_observations);
+    format_evidence_present && latch_clean && optical.proves_d1()
+}
+
 pub struct IrSession<'a> {
     cam: &'a IrCamera,
     /// `None` while [`Self::recover`] replaces a broken stream, after a failed
@@ -7494,6 +7504,29 @@ impl IrSession<'_> {
             None => vec![None; means.len()],
         };
         let from_camera = flags.iter().filter(|f| f.is_some()).count();
+
+        let mut white_level = white_level;
+        #[cfg(feature = "t480-experimental")]
+        if is_qualified(
+            self.cam.format_evidence.is_some(),
+            content.as_ref().map_or(false, |l| l.refusal().is_none()),
+            &means
+                .iter()
+                .zip(&dequeue_evidence)
+                .map(|(&mean, ev)| (ev.1.raw(), mean as f32))
+                .collect::<Vec<_>>(),
+        ) {
+            for frame in &mut frames {
+                for p in frame.iter_mut() {
+                    *p = yuyv_exposure::expand_limited_luma(*p);
+                }
+            }
+            for (i, frame) in frames.iter().enumerate() {
+                means[i] = frame.iter().map(|&p| p as f64).sum::<f64>() / frame.len().max(1) as f64;
+            }
+            white_level = Some(255);
+        }
+
         // Per-frame comparison of the two answers, for measuring how often the
         // old threshold disagreed with the camera. A disagreement is the whole
         // reason this path exists, and it can only be observed against a scene
@@ -12796,6 +12829,7 @@ mod tests {
                 "        let content = &mut self.content;",
                 "            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {",
                 "                    \"[ir] {}: YUYV content latch set for this session (not yet enforced): {newly}\",",
+                "            content.as_ref().map_or(false, |l| l.refusal().is_none()),"
             ],
             "the literal builds the latch, the field holds it, and only the burst's borrow \
              and its observe touch it; a line that reassigns, takes or clears it fails here"

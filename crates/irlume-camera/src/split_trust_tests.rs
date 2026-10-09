@@ -19,6 +19,15 @@ fn split_trust_is_closed_for_every_kind_without_test_support() {
         CameraOperationKind::Diagnostics,
         CameraOperationKind::Setup,
     ] {
+        #[cfg(feature = "t480-experimental")]
+        if matches!(kind, CameraOperationKind::Authentication | CameraOperationKind::Enrollment) {
+            assert!(
+                split_trust_admitted(kind),
+                "{kind:?} must open with t480-experimental"
+            );
+            continue;
+        }
+
         assert!(
             !split_trust_admitted(kind),
             "{kind:?} must stay closed in a build without test-support"

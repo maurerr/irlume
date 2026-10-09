@@ -15,6 +15,8 @@ ir-only-evaluation = ["dep:libc", "irlume-camera/capture-timing"]
 test-support = []
 # Optional NPU inference for authentication probes (ADR-0022).
 npu = ["irlume-vision/npu"]
+# Experimental: Allow descriptor-attested YUYV (T480 5986:1141) to pass luma.
+t480-experimental = ["irlume-camera/t480-experimental"]
 
 [[example]]
 name = "ir_only_evaluation"

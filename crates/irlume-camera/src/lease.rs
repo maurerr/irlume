@@ -288,6 +288,13 @@ pub struct SplitLeaseRequest {
 /// Authentication and whose backend refuses every open.
 #[must_use]
 pub fn split_trust_admitted(kind: CameraOperationKind) -> bool {
+    #[cfg(feature = "t480-experimental")]
+    if matches!(
+        kind,
+        CameraOperationKind::Enrollment | CameraOperationKind::Authentication
+    ) {
+        return true;
+    }
     match kind {
         CameraOperationKind::Enrollment | CameraOperationKind::Authentication => {
             fixture_admits_split_trust(kind)

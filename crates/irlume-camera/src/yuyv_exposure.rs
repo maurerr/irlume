@@ -1783,3 +1783,18 @@ mod tests {
         }
     }
 }
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn qualified_ceiling_requires_every_prerequisite_independently() {
+        // Needs 6 frames to satisfy D1OpticalEvidence (3 even, 3 odd).
+        let lit_only: Vec<(u32, f32)> = (0..8).map(|i| (i, 200.0)).collect();
+        let dark_only: Vec<(u32, f32)> = (0..8).map(|i| (i, 10.0)).collect();
+        let alternating: Vec<(u32, f32)> = (0..8).map(|i| (i, if i % 2 == 0 { 200.0 } else { 10.0 })).collect();
+
+        assert!(!super::is_qualified(true, true, &lit_only), "Previous-burst alternation is insufficient.");
+        assert!(!super::is_qualified(true, true, &dark_only));
+        assert!(!super::is_qualified(false, true, &alternating), "Missing/unknown format evidence refuses.");
+        assert!(!super::is_qualified(true, false, &alternating), "Session violation remains latched after clean frames.");
+        
+        assert!(super::is_qualified(true, true, &alternating), "Qualified ceiling applies.");
+    }

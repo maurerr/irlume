@@ -12,6 +12,8 @@ capture-timing = []
 # fixture and its thread, Enrollment or Authentication only, never Capture.
 # Only dev-dependencies enable it; no environment or configuration switch.
 test-support = []
+# Experimental: Allow descriptor-attested YUYV (T480 5986:1141) to pass luma.
+t480-experimental = []
 
 [dependencies]
 irlume-common.workspace = true

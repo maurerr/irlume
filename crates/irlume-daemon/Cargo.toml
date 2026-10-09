@@ -25,6 +25,8 @@ default = []
 # Optional NPU inference for the recognizer's authentication probes
 # (ADR-0022): the daemon opens the NPU runtime when the switch allows it.
 npu = ["irlume-auth/npu"]
+# Experimental: Allow descriptor-attested YUYV (T480 5986:1141) to pass luma.
+t480-experimental = ["irlume-auth/t480-experimental"]
 
 [dev-dependencies]
 irlume-auth = { workspace = true, features = ["test-support"] }

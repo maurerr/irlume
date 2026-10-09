@@ -239,7 +239,7 @@ impl D1OpticalEvidence {
         OpticalD1Verdict::Inconclusive
     }
 
-    const fn proves_d1(self) -> bool {
+    pub(crate) const fn proves_d1(self) -> bool {
         matches!(self.verdict(), OpticalD1Verdict::Proven)
     }
 

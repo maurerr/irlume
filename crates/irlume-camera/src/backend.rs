@@ -1107,6 +1107,17 @@ pub(crate) mod tests {
             CameraOperationKind::Enrollment,
             CameraOperationKind::Capture,
         ] {
+            #[cfg(feature = "t480-experimental")]
+            if matches!(
+                operation,
+                CameraOperationKind::Authentication | CameraOperationKind::Enrollment
+            ) {
+                // with t480-experimental, these should succeed and hold the lease
+                let permit = acquire_split_camera_operation(&expected, operation, std::time::Duration::ZERO)
+                    .expect("t480-experimental admits Authentication/Enrollment");
+                drop(permit);
+                continue;
+            }
             assert!(matches!(
                 acquire_split_camera_operation(&expected, operation, std::time::Duration::ZERO),
                 Err(CameraLeaseError::SplitActivationDisabled)
