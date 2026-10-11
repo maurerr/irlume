@@ -1782,19 +1782,142 @@ mod tests {
             );
         }
     }
-}
+
+    /// Eight-frame (sequence, mean) bursts: D1 needs at least 3 even and 3
+    /// odd frames to prove alternation.
+    #[cfg(feature = "t480-experimental")]
+    fn alternating_burst() -> Vec<(u32, f32)> {
+        (0..8)
+            .map(|i| (i, if i % 2 == 0 { 200.0 } else { 10.0 }))
+            .collect()
+    }
+
     #[cfg(feature = "t480-experimental")]
     #[test]
-    fn qualified_ceiling_requires_every_prerequisite_independently() {
-        // Needs 6 frames to satisfy D1OpticalEvidence (3 even, 3 odd).
+    fn q01_qualification_needs_current_burst_alternation_evidence_and_format() {
+        let alternating = alternating_burst();
         let lit_only: Vec<(u32, f32)> = (0..8).map(|i| (i, 200.0)).collect();
         let dark_only: Vec<(u32, f32)> = (0..8).map(|i| (i, 10.0)).collect();
-        let alternating: Vec<(u32, f32)> = (0..8).map(|i| (i, if i % 2 == 0 { 200.0 } else { 10.0 })).collect();
-
-        assert!(!super::is_qualified(true, true, &lit_only), "Previous-burst alternation is insufficient.");
-        assert!(!super::is_qualified(true, true, &dark_only));
-        assert!(!super::is_qualified(false, true, &alternating), "Missing/unknown format evidence refuses.");
-        assert!(!super::is_qualified(true, false, &alternating), "Session violation remains latched after clean frames.");
-        
-        assert!(super::is_qualified(true, true, &alternating), "Qualified ceiling applies.");
+        assert!(crate::is_qualified(true, true, &alternating));
+        assert!(!crate::is_qualified(true, true, &lit_only));
+        assert!(!crate::is_qualified(true, true, &dark_only));
+        assert!(!crate::is_qualified(false, true, &alternating));
+        assert!(!crate::is_qualified(true, false, &alternating));
     }
+
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn q02_previous_burst_evidence_never_qualifies_the_next_burst() {
+        let first = alternating_burst();
+        assert!(crate::is_qualified(true, true, &first));
+        // The next burst carries no alternation of its own, although its
+        // sequence numbers continue the stream.
+        let second: Vec<(u32, f32)> = (8..16).map(|i| (i, 200.0)).collect();
+        assert!(!crate::is_qualified(true, true, &second));
+    }
+
+    #[test]
+    fn q03_session_violation_survives_successive_clean_bursts() {
+        let clean = luma_bytes(20, 10, 120, &[]);
+        // 4 of 200 pixels (2%) at raw luma 14: over the 0.5% footroom budget.
+        let violating = luma_bytes(20, 10, 120, &[0, 50, 100, 150]);
+        let mut latch = fresh(20, 10);
+        for (i, frame) in [&violating, &clean].iter().enumerate() {
+            for _ in 0..10 {
+                latch.observe(frame);
+            }
+            assert_eq!(latch.inspected(), 10 * (i as u64 + 1));
+        }
+        // The first burst violated; a whole clean burst after it changes
+        // nothing about the refusal.
+        assert_eq!(latch.refusal(), Some(FOOTROOM));
+        for _ in 0..10 {
+            assert_eq!(latch.observe(&clean), None);
+        }
+        assert_eq!(latch.refusal(), Some(FOOTROOM));
+        assert_eq!(latch.inspected(), 30);
+    }
+
+    #[test]
+    fn q04_metadata_or_geometry_drift_refuses() {
+        assert!(limited_range_eligibility(&base()).is_ok());
+        // The same negotiation with drifted range metadata refuses.
+        assert_eq!(
+            limited_range_eligibility(&with(|raw| raw.quantization = FULL)),
+            Err(MetadataRefusal::FullRange)
+        );
+        assert_eq!(
+            limited_range_eligibility(&with(|raw| raw.colorspace = JPEG)),
+            Err(MetadataRefusal::JpegColorspace)
+        );
+        assert_eq!(
+            limited_range_eligibility(&with(|raw| raw.ycbcr_enc = XV601)),
+            Err(MetadataRefusal::ExtendedGamut)
+        );
+        // A latch bound to the 2x1 geometry refuses a 4x1 payload instead of
+        // judging foreign bytes against its layout.
+        let mut latch = YuyvContentLatch::new(base());
+        assert_eq!(
+            latch.observe(&[16, 128, 16, 128, 16, 128, 16, 128]),
+            Some(PAYLOAD_LENGTH)
+        );
+        assert_eq!(latch.refusal(), Some(PAYLOAD_LENGTH));
+        assert_eq!(latch.inspected(), 1);
+    }
+
+    #[test]
+    fn q05_rejected_frames_still_count_against_the_latch() {
+        let mut latch = fresh(2, 1);
+        // Truncated: image-short, so only the length reason latches.
+        assert_eq!(latch.observe(&[16, 128]), Some(PAYLOAD_LENGTH));
+        // Over-long with a clean image part: no new reason, but the frame is
+        // still offered and counted.
+        assert_eq!(latch.observe(&[16, 128, 16, 128, 0]), None);
+        // A clean frame after two rejected ones changes nothing.
+        assert_eq!(latch.observe(&[16, 128, 235, 128]), None);
+        assert_eq!(latch.refusal(), Some(PAYLOAD_LENGTH));
+        assert_eq!(latch.inspected(), 3);
+    }
+
+    #[test]
+    fn q06_unqualified_yuyv_keeps_no_ceiling_for_consumers() {
+        // The format-only invariant the qualification builds on, not around.
+        for quantization in [
+            Quantization::Default,
+            Quantization::FullRange,
+            Quantization::LimitedRange,
+        ] {
+            assert_eq!(
+                crate::clipping_white_level(crate::IrPixel::YuyvLuma, quantization),
+                None,
+                "{quantization:?}"
+            );
+            assert_eq!(
+                crate::IrDecoder::new(crate::IrPixel::YuyvLuma, quantization).white_level(),
+                None,
+                "{quantization:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn q07_qualified_expansion_feeds_the_ceiling_consumers() {
+        // Two decoded pixels: raw limited-range ceiling 235 and footroom 16.
+        let decoded = crate::decode_ir(&[235, 128, 16, 128], crate::IrPixel::YuyvLuma, 2, 1);
+        assert_eq!(decoded, vec![235, 16]);
+        let raw_mean = decoded.iter().map(|&y| f64::from(y)).sum::<f64>() / decoded.len() as f64;
+        let expanded: Vec<u8> = decoded.iter().map(|&y| expand_limited_luma(y)).collect();
+        assert_eq!(expanded, vec![255, 0]);
+        let expanded_mean =
+            expanded.iter().map(|&y| f64::from(y)).sum::<f64>() / expanded.len() as f64;
+        assert!(expanded_mean > raw_mean);
+        // The qualified ceiling measures the expanded domain.
+        assert_eq!(crate::ir_probe::saturated_fraction(&expanded, 255), 0.5);
+        // The same raw pixels name no ceiling, so no fraction exists for them.
+        assert_eq!(
+            crate::clipping_white_level(crate::IrPixel::YuyvLuma, Quantization::LimitedRange),
+            None
+        );
+    }
+}

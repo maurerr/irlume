@@ -1113,8 +1113,9 @@ pub(crate) mod tests {
                 CameraOperationKind::Authentication | CameraOperationKind::Enrollment
             ) {
                 // with t480-experimental, these should succeed and hold the lease
-                let permit = acquire_split_camera_operation(&expected, operation, std::time::Duration::ZERO)
-                    .expect("t480-experimental admits Authentication/Enrollment");
+                let permit =
+                    acquire_split_camera_operation(&expected, operation, std::time::Duration::ZERO)
+                        .expect("t480-experimental admits Authentication/Enrollment");
                 drop(permit);
                 continue;
             }

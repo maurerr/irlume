@@ -100,7 +100,9 @@ impl EmitterControl {
 pub const IR_LIT_MEAN: f32 = 40.0;
 /// Minimum mean lift over the emitter-off baseline before [`discover`]
 /// calls a control a success; filters ambient flicker and exposure drift.
-const AUTOCONF_MIN_LIFT: f32 = 20.0;
+/// Reused by the experimental D1 provenance derivation as the per-frame
+/// corroboration threshold, so that path introduces no second constant.
+pub(crate) const AUTOCONF_MIN_LIFT: f32 = 20.0;
 /// A baseline/restored burst is affirmative D1-off evidence only when the two
 /// raw-sequence phases differ by no more than one decoded 8-bit mean point.
 /// Anything above that noise-sized band is ambiguous rather than the negation
@@ -115,6 +117,10 @@ const MAX_D1_MISSING_SEQUENCE_FRAMES: u32 = 1;
 pub(crate) struct D1OpticalEvidence {
     even_frames: usize,
     odd_frames: usize,
+    /// Which raw-sequence parity carried the bright phase of this burst. Kept so
+    /// the experimental provenance derivation can reuse THIS burst's own phase
+    /// assignment instead of recomputing a second one.
+    bright_even: bool,
     phase_delta: f32,
     bright_phase_support: usize,
     dark_phase_support: usize,
@@ -207,6 +213,7 @@ impl D1OpticalEvidence {
         Self {
             even_frames: even.len(),
             odd_frames: odd.len(),
+            bright_even,
             phase_delta: (even_median - odd_median).abs(),
             bright_phase_support,
             dark_phase_support,
@@ -241,6 +248,38 @@ impl D1OpticalEvidence {
 
     pub(crate) const fn proves_d1(self) -> bool {
         matches!(self.verdict(), OpticalD1Verdict::Proven)
+    }
+
+    /// The raw-sequence parity that carried this burst's bright phase. The
+    /// experimental per-frame provenance derivation pairs each frame's parity
+    /// with its own brightness against this, reusing the phase assignment that
+    /// [`Self::verdict`] was computed from.
+    #[cfg_attr(
+        not(feature = "t480-experimental"),
+        expect(
+            dead_code,
+            reason = "read only by the t480-experimental provenance derivation"
+        )
+    )]
+    pub(crate) const fn bright_even(self) -> bool {
+        self.bright_even
+    }
+
+    /// Verdict as a stable lowercase category, for debug output that must not
+    /// print frame data.
+    #[cfg_attr(
+        not(feature = "t480-experimental"),
+        expect(
+            dead_code,
+            reason = "read only by the t480-experimental provenance derivation"
+        )
+    )]
+    pub(crate) const fn verdict_category(self) -> &'static str {
+        match self.verdict() {
+            OpticalD1Verdict::Proven => "proven",
+            OpticalD1Verdict::Refuted => "refuted",
+            OpticalD1Verdict::Inconclusive => "inconclusive",
+        }
     }
 
     const fn valid_for_causality(self) -> bool {

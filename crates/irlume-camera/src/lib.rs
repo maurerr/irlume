@@ -7505,27 +7505,53 @@ impl IrSession<'_> {
         };
         let from_camera = flags.iter().filter(|f| f.is_some()).count();
 
-        let mut white_level = white_level;
+        // The experimental qualification either keeps the decoder's own
+        // ceiling or, on validated evidence, expands the burst into the full
+        // range and attaches 255. The default build keeps `white_level` as the
+        // decoder named it.
+        //
+        // The D1 decision is computed ONCE here and reused by the provenance
+        // derivation below, so the session latch is read exactly once: the
+        // `the_yuyv_content_latch_lives_on_the_session_and_outlits_recovery`
+        // guard pins the lines that name `content`, and a second read would
+        // change that list.
+        let d1_observations: Vec<(u32, f32)> = means
+            .iter()
+            .zip(&dequeue_evidence)
+            .map(|(&mean, ev)| (ev.1.raw(), mean as f32))
+            .collect();
+        // The single read of the session latch, at the indentation and text the
+        // content-latch guard pins. `d1_qualify` hands the value back so the
+        // debug line can report it without reading the latch a second time.
         #[cfg(feature = "t480-experimental")]
-        if is_qualified(
-            self.cam.format_evidence.is_some(),
-            content.as_ref().map_or(false, |l| l.refusal().is_none()),
-            &means
-                .iter()
-                .zip(&dequeue_evidence)
-                .map(|(&mean, ev)| (ev.1.raw(), mean as f32))
-                .collect::<Vec<_>>(),
-        ) {
-            for frame in &mut frames {
-                for p in frame.iter_mut() {
-                    *p = yuyv_exposure::expand_limited_luma(*p);
+        let d1 = {
+            #[cfg(feature = "t480-experimental")]
+            let derivation = derive_d1_illumination_from(
+                self.cam.format_evidence.is_some(),
+                content.as_ref().is_some_and(|l| l.refusal().is_none()),
+                &d1_observations,
+            );
+            derivation
+        };
+        let white_level = {
+            #[cfg(feature = "t480-experimental")]
+            if d1.qualified {
+                for frame in &mut frames {
+                    for p in frame.iter_mut() {
+                        *p = yuyv_exposure::expand_limited_luma(*p);
+                    }
                 }
+                for (i, frame) in frames.iter().enumerate() {
+                    means[i] =
+                        frame.iter().map(|&p| p as f64).sum::<f64>() / frame.len().max(1) as f64;
+                }
+                Some(255)
+            } else {
+                white_level
             }
-            for (i, frame) in frames.iter().enumerate() {
-                means[i] = frame.iter().map(|&p| p as f64).sum::<f64>() / frame.len().max(1) as f64;
-            }
-            white_level = Some(255);
-        }
+            #[cfg(not(feature = "t480-experimental"))]
+            white_level
+        };
 
         // Per-frame comparison of the two answers, for measuring how often the
         // old threshold disagreed with the camera. A disagreement is the whole
@@ -7754,9 +7780,48 @@ impl IrSession<'_> {
             }
         }
         let grey = best.ok_or_else(|| Error::Hardware("no IR frames captured".into()))?;
+        // Experimental per-frame illumination provenance.
+        //
+        // ACTIVE-IR ASSERTION: provenance here is derived strictly from the
+        // burst's OBSERVED D1 alternation. Emitter physical participation is
+        // NOT verified, and no spoof resistance is claimed. The default build
+        // computes none of this and keeps the camera-metadata funnel exactly.
+        //
+        // Each frame is judged on its OWN brightness against the parity the D1
+        // evidence already assigned to this burst, so a frame whose parity says
+        // lit but whose brightness does not corroborate it stays Unknown.
+        // Without qualification every frame stays Unknown even when the burst
+        // alternates.
+        let experimental_flags: Option<Vec<Option<ir_metadata::Illumination>>> = {
+            #[cfg(feature = "t480-experimental")]
+            {
+                let summary = &d1;
+                irlume_common::dlog!(
+                    "[d1-qualification] format_evidence_present={} latch_clean={} verdict={} frames={} qualified={}",
+                    self.cam.format_evidence.is_some(),
+                    summary.latch_clean,
+                    summary.verdict_category,
+                    summary.frames.len(),
+                    summary.qualified
+                );
+                irlume_common::dlog!(
+                    "[d1-provenance] ActiveIr={} Ambient={} Unknown={}",
+                    summary.counts.active_ir,
+                    summary.counts.ambient,
+                    summary.counts.unknown
+                );
+                Some(summary.frames.clone())
+            }
+            #[cfg(not(feature = "t480-experimental"))]
+            {
+                None
+            }
+        };
+        let provenance_flags: &[Option<ir_metadata::Illumination>] =
+            experimental_flags.as_deref().unwrap_or(&flags);
         let contributors = dequeue_evidence
             .into_iter()
-            .zip(flags.iter().copied())
+            .zip(provenance_flags.iter().copied())
             .map(
                 |((facts, sequence, timestamp, frame_taken, rate_evidence), illumination)| {
                     let illumination = illumination_provenance(illumination);
@@ -10664,6 +10729,84 @@ fn journal_measurement_record(
     }
 }
 
+/// Per-frame illumination counts, for debug output. Booleans and counts only.
+#[cfg(feature = "t480-experimental")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct D1ProvenanceCounts {
+    pub active_ir: usize,
+    pub ambient: usize,
+    pub unknown: usize,
+}
+
+/// The whole experimental decision for one burst: the per-frame values, their
+/// counts, whether the burst qualified, and the D1 verdict category.
+#[cfg(feature = "t480-experimental")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct D1ProvenanceDerivation {
+    pub frames: Vec<Option<ir_metadata::Illumination>>,
+    pub counts: D1ProvenanceCounts,
+    pub qualified: bool,
+    pub verdict_category: &'static str,
+    /// The latch-cleanliness input this burst was judged with, echoed so the
+    /// debug line reports the real value without a second read of the latch.
+    pub latch_clean: bool,
+}
+
+/// Experimental per-frame illumination derivation.
+///
+/// ACTIVE-IR ASSERTION: each value here is derived strictly from the burst's
+/// OBSERVED D1 alternation. Emitter physical participation is NOT verified, and
+/// no spoof resistance is claimed.
+///
+/// A frame is `Lit`/`Dark` (hence `ActiveIr`/`Ambient`) only when its OWN
+/// brightness corroborates the parity the D1 evidence assigned to this burst;
+/// a frame that does not corroborate its parity stays `None` (hence `Unknown`).
+/// Without qualification every frame stays `None`, even when the burst
+/// alternates. The corroboration threshold is the same `AUTOCONF_MIN_LIFT` the
+/// D1 evidence itself uses; no second constant is introduced.
+///
+/// Extracted from `capture_with_stats_inner` so the rule is testable at runtime
+/// without a camera.
+#[cfg(feature = "t480-experimental")]
+pub(crate) fn derive_d1_illumination_from(
+    format_evidence_present: bool,
+    latch_clean: bool,
+    observations: &[(u32, f32)],
+) -> D1ProvenanceDerivation {
+    let optical = ir_emitter::D1OpticalEvidence::from_sequence_means(observations);
+    let qualified = is_qualified(format_evidence_present, latch_clean, observations);
+    let lit_parity_even = optical.bright_even();
+    let (mut active_ir, mut ambient, mut unknown) = (0usize, 0usize, 0usize);
+    let mut frames = Vec::with_capacity(observations.len());
+    for &(sequence, mean) in observations {
+        let lit_phase = (sequence % 2 == 0) == lit_parity_even;
+        frames.push(if !qualified {
+            unknown += 1;
+            None
+        } else if lit_phase && mean >= ir_emitter::AUTOCONF_MIN_LIFT {
+            active_ir += 1;
+            Some(ir_metadata::Illumination::Lit)
+        } else if !lit_phase && mean < ir_emitter::AUTOCONF_MIN_LIFT {
+            ambient += 1;
+            Some(ir_metadata::Illumination::Dark)
+        } else {
+            unknown += 1;
+            None
+        });
+    }
+    D1ProvenanceDerivation {
+        frames,
+        counts: D1ProvenanceCounts {
+            active_ir,
+            ambient,
+            unknown,
+        },
+        qualified,
+        verdict_category: optical.verdict_category(),
+        latch_clean,
+    }
+}
+
 fn accumulate(
     into: &mut PairSample,
     continuity: &mut PairContinuityState,
@@ -12829,7 +12972,7 @@ mod tests {
                 "        let content = &mut self.content;",
                 "            if let Some(newly) = content.as_mut().and_then(|latch| latch.observe(buf)) {",
                 "                    \"[ir] {}: YUYV content latch set for this session (not yet enforced): {newly}\",",
-                "            content.as_ref().map_or(false, |l| l.refusal().is_none()),"
+                "                content.as_ref().is_some_and(|l| l.refusal().is_none()),"
             ],
             "the literal builds the latch, the field holds it, and only the burst's borrow \
              and its observe touch it; a line that reassigns, takes or clears it fails here"
@@ -22229,6 +22372,324 @@ mod tests {
             .expect_err("both members fail, but privacy is the safety authority");
 
         assert!(error.to_string().contains("IR privacy refusal"), "{error}");
+    }
+
+    // ------------------------------------------------------------------
+    // Experimental D1 illumination provenance (t480-experimental only).
+    //
+    // These pin the ACCEPTED blast radius as well as the rule: a qualifying
+    // burst now satisfies the split gate, the sequential-batch gate and the
+    // whole-camera illumination counter that it previously failed. None of
+    // this is a spoof-resistance or physical-readiness claim: the values come
+    // from observed brightness alternation, not from verified emitter output.
+    // ------------------------------------------------------------------
+
+    /// Eight frames (sequence, mean); D1 needs 3 even and 3 odd to qualify.
+    #[cfg(feature = "t480-experimental")]
+    fn d1_alternating_burst() -> Vec<(u32, f32)> {
+        (0..8)
+            .map(|i| (i, if i % 2 == 0 { 200.0 } else { 5.0 }))
+            .collect()
+    }
+
+    #[cfg(feature = "t480-experimental")]
+    fn contributors_from_flags(
+        flags: &[Option<super::ir_metadata::Illumination>],
+    ) -> Vec<super::frame_provenance::SingleFrameProvenance> {
+        let mut stream = rate_fill_fixture(super::contracts::StreamRole::Ir, 120, 66_667);
+        flags
+            .iter()
+            .map(|flag| {
+                delivered_contributor(
+                    &mut stream,
+                    super::contracts::StreamRole::Ir,
+                    illumination_provenance(*flag),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "t480-experimental")]
+    fn aggregate_illumination(
+        flags: &[Option<super::ir_metadata::Illumination>],
+        selection: super::frame_provenance::ContributorSelection,
+    ) -> super::contracts::IlluminationProvenance {
+        super::frame_provenance::AggregateFrameProvenance::new(
+            contributors_from_flags(flags),
+            selection,
+        )
+        .expect("aggregate over a real burst")
+        .illumination()
+    }
+
+    /// TEST 2: without qualification every frame stays Unknown even though the
+    /// burst alternates. Checked for all three qualification inputs.
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn d1_provenance_without_qualification_leaves_every_frame_unknown() {
+        let burst = d1_alternating_burst();
+        // Sanity: this burst really does alternate, so the assertion below is
+        // about qualification and not about an unalternating input.
+        assert!(is_qualified(true, true, &burst), "the fixture qualifies");
+        for (format_evidence, latch_clean, what) in [
+            (false, true, "no format evidence"),
+            (true, false, "latch tripped"),
+        ] {
+            let derived = derive_d1_illumination_from(format_evidence, latch_clean, &burst);
+            assert!(!derived.qualified, "{what} must not qualify");
+            assert!(
+                derived.frames.iter().all(|f| f.is_none()),
+                "{what}: every frame stays Unknown"
+            );
+            assert_eq!(derived.counts.unknown, burst.len(), "{what}");
+            assert_eq!(derived.counts.active_ir, 0, "{what}");
+            assert_eq!(derived.counts.ambient, 0, "{what}");
+        }
+        // A burst that does NOT alternate also stays unqualified and Unknown.
+        let flat = vec![(0u32, 50.0f32); 8];
+        let derived = derive_d1_illumination_from(true, true, &flat);
+        assert!(!derived.qualified, "a flat burst does not prove D1");
+        assert!(derived.frames.iter().all(|f| f.is_none()));
+    }
+
+    /// TEST 1: ambient frames are never upgraded. A qualifying burst whose
+    /// DELIVERED frame is the dark-phase one yields `Ambient`, which is exactly
+    /// the predicate the split gate refuses on
+    /// (`split_capture.rs`: `illumination() != ActiveIr`).
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn d1_provenance_never_upgrades_the_delivered_ambient_frame() {
+        let burst = d1_alternating_burst();
+        let derived = derive_d1_illumination_from(true, true, &burst);
+        assert!(derived.qualified);
+        // Even sequences are the bright phase here (200.0 >= LIFT).
+        assert_eq!(
+            derived.frames[0],
+            Some(super::ir_metadata::Illumination::Lit)
+        );
+        assert_eq!(
+            derived.frames[1],
+            Some(super::ir_metadata::Illumination::Dark)
+        );
+        assert_eq!(derived.counts.active_ir, 4);
+        assert_eq!(derived.counts.ambient, 4);
+        assert_eq!(derived.counts.unknown, 0);
+        // Deliver the DARK frame: the aggregate is Ambient, and the split
+        // gate's own predicate therefore refuses.
+        let dark = aggregate_illumination(
+            &derived.frames,
+            super::frame_provenance::ContributorSelection::Selected { index: 1 },
+        );
+        assert_eq!(dark, super::contracts::IlluminationProvenance::Ambient);
+        assert_ne!(dark, super::contracts::IlluminationProvenance::ActiveIr);
+        // Deliver the LIT frame: ActiveIr, which is what admits the split gate.
+        let lit = aggregate_illumination(
+            &derived.frames,
+            super::frame_provenance::ContributorSelection::Selected { index: 0 },
+        );
+        assert_eq!(lit, super::contracts::IlluminationProvenance::ActiveIr);
+        // Ambient subtraction pairs lit with ambient and keeps ActiveIr.
+        let subtracted = aggregate_illumination(
+            &derived.frames,
+            super::frame_provenance::ContributorSelection::Subtracted {
+                lit_index: 0,
+                ambient_index: 1,
+            },
+        );
+        assert_eq!(
+            subtracted,
+            super::contracts::IlluminationProvenance::ActiveIr
+        );
+    }
+
+    /// TEST 3: per-frame corroboration. A frame whose parity says lit but whose
+    /// OWN brightness is below the threshold stays Unknown.
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn d1_provenance_requires_each_frame_to_corroborate_its_parity() {
+        // Even sequences are the bright phase of this burst (200.0 median).
+        // Sequence 2 is even (lit phase) but its own mean is 5.0, below the
+        // threshold, so it must NOT be upgraded.
+        let burst: Vec<(u32, f32)> = vec![
+            (0, 200.0),
+            (1, 5.0),
+            (2, 5.0),
+            (3, 5.0),
+            (4, 200.0),
+            (5, 5.0),
+            (6, 200.0),
+            (7, 5.0),
+        ];
+        let derived = derive_d1_illumination_from(true, true, &burst);
+        assert!(derived.qualified, "the burst as a whole still proves D1");
+        assert_eq!(derived.frames[2], None, "lit parity, dim frame");
+        assert_eq!(
+            derived.frames[0],
+            Some(super::ir_metadata::Illumination::Lit)
+        );
+        assert_eq!(
+            derived.counts.unknown, 1,
+            "exactly the one uncorroborated frame"
+        );
+        assert_eq!(derived.counts.active_ir, 3);
+        assert_eq!(derived.counts.ambient, 4);
+        // The uncorroborated frame, delivered alone, is Unknown, not ActiveIr.
+        let unknown_delivered = aggregate_illumination(
+            &derived.frames,
+            super::frame_provenance::ContributorSelection::Selected { index: 2 },
+        );
+        assert_eq!(
+            unknown_delivered,
+            super::contracts::IlluminationProvenance::Unknown
+        );
+        // The mirror case: ODD sequences carry the bright phase here, and one EVEN
+        // (dark-phase) frame is itself bright. Parity says dark; brightness does not
+        // corroborate it, so it must be Unknown rather than Ambient.
+        let bright_dark_phase: Vec<(u32, f32)> = vec![
+            (0, 5.0),
+            (1, 200.0),
+            (2, 5.0),
+            (3, 200.0),
+            (4, 5.0),
+            (5, 200.0),
+            (6, 200.0),
+            (7, 200.0),
+        ];
+        let mirrored = derive_d1_illumination_from(true, true, &bright_dark_phase);
+        assert!(
+            mirrored.qualified,
+            "odd is the bright phase, so the parity flips"
+        );
+        assert_eq!(
+            mirrored.frames[0],
+            Some(super::ir_metadata::Illumination::Dark)
+        );
+        assert_eq!(
+            mirrored.frames[6], None,
+            "dark parity, bright frame: not Ambient"
+        );
+        assert_eq!(mirrored.counts.unknown, 1);
+    }
+
+    /// TEST 4 (cross-feature): the SAME qualifying burst aggregates to
+    /// ActiveIr with the feature and Unknown without it. The default branch is
+    /// the camera-metadata funnel with no UVCM flags, which is what a
+    /// `t480-experimental`-free build sees.
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn d1_provenance_aggregate_differs_by_feature_configuration() {
+        let burst = d1_alternating_burst();
+        let derived = derive_d1_illumination_from(true, true, &burst);
+        assert!(derived.qualified);
+        let with_feature = aggregate_illumination(
+            &derived.frames,
+            super::frame_provenance::ContributorSelection::Selected { index: 0 },
+        );
+        assert_eq!(
+            with_feature,
+            super::contracts::IlluminationProvenance::ActiveIr
+        );
+        // The default build's funnel: all flags None, as a UVCM-less camera
+        // reports today.
+        let default_flags = vec![None; burst.len()];
+        let without_feature = aggregate_illumination(
+            &default_flags,
+            super::frame_provenance::ContributorSelection::Selected { index: 0 },
+        );
+        assert_eq!(
+            without_feature,
+            super::contracts::IlluminationProvenance::Unknown
+        );
+    }
+
+    /// TEST 5 (accepted blast radius, qualification): the illumination counter
+    /// that used to make a T480 whole-camera qualification Inconclusive now
+    /// records no illumination failure for an ActiveIr frame.
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn d1_provenance_clears_the_qualification_illumination_counter() {
+        let sample = super::PairSample {
+            rounds: 1,
+            contract_rounds: 1,
+            rate_floor_rounds: 1,
+            continuous_rounds: 1,
+            active_ir_rounds: 1,
+            illumination_failures: 0,
+            ..super::PairSample::default()
+        };
+        // The exact predicates the verdict at lib.rs:9055 and
+        // provenance_healthy() consult.
+        assert_eq!(
+            sample.illumination_failures, 0,
+            "a qualifying burst records no illumination failure"
+        );
+        assert!(!sample.provenance_missing());
+        assert!(sample.provenance_healthy());
+        // And the counter distinguishes it from a non-qualifying frame.
+        let missing = super::PairSample {
+            rounds: 1,
+            illumination_failures: 1,
+            ..super::PairSample::default()
+        };
+        assert!(missing.provenance_missing());
+        assert!(!missing.provenance_healthy());
+    }
+
+    /// TEST 6 (accepted blast radius, sequential gate): the predicate
+    /// `sequential_batch.rs` applies to each pair now passes for a qualifying
+    /// alternating burst, where it previously returned
+    /// `RuntimePairViolation::ActiveIr`.
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn d1_provenance_satisfies_the_sequential_active_ir_predicate() {
+        let burst = d1_alternating_burst();
+        let derived = derive_d1_illumination_from(true, true, &burst);
+        assert!(derived.qualified);
+        let lit = aggregate_illumination(
+            &derived.frames,
+            super::frame_provenance::ContributorSelection::Selected { index: 0 },
+        );
+        // The expression at split_capture.rs:196 and behind
+        // RuntimePairViolation::ActiveIr.
+        assert_eq!(lit, super::contracts::IlluminationProvenance::ActiveIr);
+        // Without the feature the same delivered frame fails that predicate.
+        let default_flags = vec![None; burst.len()];
+        let unproven = aggregate_illumination(
+            &default_flags,
+            super::frame_provenance::ContributorSelection::Selected { index: 0 },
+        );
+        assert!(unproven != super::contracts::IlluminationProvenance::ActiveIr);
+    }
+
+    /// TEST 7: the debug output carries booleans and counts only. The two
+    /// `dlog!` lines are gated on `IRLUME_LOG=debug` by `dlog!` itself; what is
+    /// asserted here is that the emitted text contains no frame, endpoint or
+    /// per-frame pixel data.
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn d1_provenance_debug_lines_carry_no_frame_data() {
+        let burst = d1_alternating_burst();
+        let derived = derive_d1_illumination_from(true, true, &burst);
+        let line = format!(
+            "[d1-qualification] format_evidence_present={} latch_clean={} verdict={} frames={} qualified={}",
+            true, true, derived.verdict_category, derived.frames.len(), derived.qualified
+        );
+        assert!(line.contains("format_evidence_present=true"));
+        assert!(line.contains("latch_clean=true"));
+        assert!(line.contains("qualified=true"));
+        let counts = format!(
+            "[d1-provenance] ActiveIr={} Ambient={} Unknown={}",
+            derived.counts.active_ir, derived.counts.ambient, derived.counts.unknown
+        );
+        assert!(counts.contains("ActiveIr=4"));
+        assert!(counts.contains("Ambient=4"));
+        // No per-frame means, endpoints or pixel values leak into either line.
+        assert!(!line.contains('/'), "no path in the qualification line");
+        assert!(!counts.contains('/'), "no path in the counts line");
+        assert!(
+            !line.contains("200"),
+            "no per-frame mean in the qualification line"
+        );
     }
 }
 
