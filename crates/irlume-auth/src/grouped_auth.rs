@@ -375,7 +375,10 @@ impl Engine {
                         evidence.assessment.signals.rgb_face.is_some()
                             || evidence.assessment.split_pair;
                 }
-                self.qualify_rgb_pad_evidence(&mut evidence.assessment);
+                self.qualify_rgb_pad_evidence(
+                    &mut evidence.assessment,
+                    PadWindowScope::Authentication,
+                );
                 let final_sample = index + 1 == VIT_PAD_VOTE_N;
                 let refusal = match modality {
                     GroupModality::Pair => self.grouped_evidence_refusal(&evidence.assessment),

@@ -908,6 +908,17 @@ pub(crate) fn load_key_with(
     // A key sealed for another uid is never unsealed (the account's
     // enrollment then reads as absent; see `storage`).
     account.require(Record::TemplateKey, env.uid)?;
+    // Name the envelope before the TPM sees it. The template key, the keyring
+    // token and the login password are three separate files with three separate
+    // policies, and `tpm::unseal` logs the policy legs without saying which
+    // file they belong to, so a journal line alone could not attribute a
+    // POLICY_FAIL to one of them.
+    irlume_common::dlog!(
+        "tpm: unsealing template key for '{user}' from {} (policy {:?}, PCRs {:?})",
+        path.display(),
+        env.policy,
+        env.pcrs
+    );
     let key = unseal(&env)?;
     // Best-effort tier auto-upgrade (mirrors keyring::reseal_password): if a
     // strictly stronger policy is available than the one this key was sealed

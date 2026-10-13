@@ -121,6 +121,24 @@ pub(crate) const FOOTROOM_PIXELS_PER_ALLOWED_LOW: usize = 200;
 /// uncalibrated (ADR-0031, Amendment 2026-10-06).
 pub(crate) const MAX_COMBINED_CHROMA_SPAN: u8 = 2;
 
+/// The combined U and V span the **session latch** tolerates.
+///
+/// Equal to `MAX_COMBINED_CHROMA_SPAN` on every build but `t480-experimental`,
+/// where the bound is widened to cover read noise on the T480's IR sensor.
+/// ADR-0031 §4 recorded a span of exactly 2 on one T480 capture and the ADR
+/// itself notes the bound "has no margin"; `combined_chroma_span` is a global
+/// min/max over every pixel, so one noisy byte out of ~57_800 trips it.
+///
+/// This constant governs the latch only. `chroma_flat` and the §4 verdict in
+/// `exposure_prerequisite` keep `MAX_COMBINED_CHROMA_SPAN` unconditionally, so
+/// the standard pipeline, its behaviour and its assertions are unchanged. A
+/// span that wide is still far from content-bearing: ADR-0031 §4 measures a
+/// genuinely non-flat frame at 230 codes.
+#[cfg(not(feature = "t480-experimental"))]
+pub(crate) const LATCH_COMBINED_CHROMA_SPAN: u8 = MAX_COMBINED_CHROMA_SPAN;
+#[cfg(feature = "t480-experimental")]
+pub(crate) const LATCH_COMBINED_CHROMA_SPAN: u8 = 8;
+
 /// Footroom and chroma facts of one validated YUYV frame. Only `scan_image`
 /// builds one, from an image the tight layout defines, so its counts always
 /// describe a whole image of at least one macropixel.
@@ -583,7 +601,10 @@ fn frame_refusal(raw: &RawYuyvFormat, payload: &[u8]) -> ContentRefusal {
     match payload.get(..image_bytes).map(scan_image) {
         Some(Ok(facts)) => {
             shown.footroom = facts.footroom_violated();
-            shown.chroma = !facts.chroma_flat();
+            // Judged against the latch tolerance rather than `chroma_flat`, so
+            // `t480-experimental` can accommodate sensor read noise without
+            // touching the §4 verdict or any standard-pipeline assertion.
+            shown.chroma = facts.combined_chroma_span() > LATCH_COMBINED_CHROMA_SPAN;
         }
         Some(Err(_)) => shown.uninspectable = true,
         // Shorter than the image: `payload_length` is already set.
@@ -1408,6 +1429,63 @@ mod tests {
         }
     }
 
+    /// The latch tolerance is the only thing `t480-experimental` widens, and it
+    /// never widens it past content-bearing chroma.
+    #[test]
+    fn c05_latch_tolerance_is_feature_scoped_and_bounded() {
+        #[cfg(not(feature = "t480-experimental"))]
+        {
+            assert_eq!(LATCH_COMBINED_CHROMA_SPAN, MAX_COMBINED_CHROMA_SPAN);
+            assert_eq!(LATCH_COMBINED_CHROMA_SPAN, 2);
+        }
+        #[cfg(feature = "t480-experimental")]
+        {
+            assert_eq!(LATCH_COMBINED_CHROMA_SPAN, 8);
+            assert!(LATCH_COMBINED_CHROMA_SPAN > MAX_COMBINED_CHROMA_SPAN);
+            // Still nowhere near ADR-0031 §4's non-flat measurement of 230.
+            assert!(LATCH_COMBINED_CHROMA_SPAN < 230);
+        }
+    }
+
+    /// `chroma_flat` and the §4 verdict keep the strict bound in **every**
+    /// configuration. This is the assertion that would fail if the experimental
+    /// accommodation were made in the wrong place.
+    #[test]
+    fn c06_standard_chroma_flatness_is_never_relaxed() {
+        let three = frame(2, 1, &[16, 100, 16, 103]);
+        assert_eq!(three.combined_chroma_span(), 3);
+        assert!(!three.chroma_flat(), "the §4 bound is unconditional");
+
+        let two = frame(2, 1, &[16, 100, 16, 102]);
+        assert!(two.chroma_flat());
+
+        let content = frame(2, 1, &[16, 10, 16, 240]);
+        assert_eq!(content.combined_chroma_span(), 230);
+        assert!(!content.chroma_flat());
+        assert!(
+            content.combined_chroma_span() > LATCH_COMBINED_CHROMA_SPAN,
+            "content-bearing chroma refuses even with the experimental tolerance"
+        );
+    }
+
+    /// The latch refuses a wide span on every build, and refuses a narrow one
+    /// only where the feature has not widened the tolerance.
+    #[test]
+    fn c07_latch_accepts_sensor_noise_only_under_the_feature() {
+        // Span 9 is past both bounds: the latch must refuse it regardless.
+        let wide = [16_u8, 100, 16, 109];
+        let mut latch = fresh(2, 1);
+        assert_eq!(latch.observe(&wide), Some(CHROMA));
+
+        // Span 3 is the T480's noise case.
+        let narrow = [16_u8, 100, 16, 103];
+        let mut latch = fresh(2, 1);
+        #[cfg(not(feature = "t480-experimental"))]
+        assert_eq!(latch.observe(&narrow), Some(CHROMA));
+        #[cfg(feature = "t480-experimental")]
+        assert_eq!(latch.observe(&narrow), None);
+    }
+
     const FOOTROOM: ContentRefusal = ContentRefusal {
         footroom: true,
         ..ContentRefusal::NONE
@@ -1429,6 +1507,13 @@ mod tests {
         uninspectable: true,
         ..ContentRefusal::NONE
     };
+
+    // A chroma span past the latch tolerance on every build: 3 under the standard
+    // bound, 9 under the one `t480-experimental` adds.
+    #[cfg(not(feature = "t480-experimental"))]
+    const LATCH_CHROMA_FRAME: [u8; 4] = [16, 100, 16, 103];
+    #[cfg(feature = "t480-experimental")]
+    const LATCH_CHROMA_FRAME: [u8; 4] = [16, 100, 16, 109];
 
     /// A session's latch for `base()` at `width` x `height` with a tight
     /// stride.
@@ -1570,7 +1655,7 @@ mod tests {
         assert_eq!(latch.inspected(), 32);
         // A clean frame of the exact length clears no other reason either.
         for (first, reason) in [
-            (&[16, 100, 16, 103][..], CHROMA),
+            (&LATCH_CHROMA_FRAME[..], CHROMA),
             (&L01[..3], PAYLOAD_LENGTH),
         ] {
             let mut latch = fresh(2, 1);
@@ -1595,22 +1680,43 @@ mod tests {
         assert_eq!(two.observe(&[16, 100, 16, 102]), None);
         assert_eq!(two.refusal(), None);
         let mut three = fresh(2, 1);
-        assert_eq!(three.observe(&[16, 100, 16, 103]), Some(CHROMA));
-        assert_eq!(three.refusal(), Some(CHROMA));
+        // Span 3 is the T480 read-noise case: inside the tolerance the
+        // feature adds, outside the bound every other build enforces.
+        #[cfg(not(feature = "t480-experimental"))]
+        {
+            assert_eq!(three.observe(&[16, 100, 16, 103]), Some(CHROMA));
+            assert_eq!(three.refusal(), Some(CHROMA));
+        }
+        #[cfg(feature = "t480-experimental")]
+        assert_eq!(three.observe(&[16, 100, 16, 103]), None);
+        let mut wide = fresh(2, 1);
+        assert_eq!(wide.observe(&[16, 100, 16, 109]), Some(CHROMA));
         for (channel, bytes) in [
             ("U", [16, 100, 16, 100, 16, 103, 16, 100]),
             ("V", [16, 100, 16, 100, 16, 100, 16, 103]),
         ] {
             let mut latch = fresh(4, 1);
-            assert_eq!(latch.observe(&bytes), Some(CHROMA), "{channel} only");
-            assert_eq!(latch.refusal(), Some(CHROMA), "{channel} only");
+            #[cfg(not(feature = "t480-experimental"))]
+            {
+                assert_eq!(latch.observe(&bytes), Some(CHROMA), "{channel} only");
+                assert_eq!(latch.refusal(), Some(CHROMA), "{channel} only");
+            }
+            #[cfg(feature = "t480-experimental")]
+            assert_eq!(latch.observe(&bytes), None, "{channel} only");
+            // Past the widened bound, either channel alone still refuses.
+            let mut latch = fresh(4, 1);
+            let wide: Vec<u8> = bytes
+                .iter()
+                .map(|b| if *b == 103 { 109 } else { *b })
+                .collect();
+            assert_eq!(latch.observe(&wide), Some(CHROMA), "{channel} wide");
         }
     }
 
     #[test]
     fn k07_reasons_latch_independently_and_accumulate() {
         let footroom = [14, 128, 14, 128];
-        let chroma = [16, 100, 16, 103];
+        let chroma = LATCH_CHROMA_FRAME;
         for order in [[footroom, chroma], [chroma, footroom]] {
             let mut latch = fresh(2, 1);
             for frame in order {
@@ -1678,12 +1784,18 @@ mod tests {
 
     #[test]
     fn k10_observe_reports_each_reason_once() {
+        // A span past the latch tolerance on every build: 3 under the
+        // standard bound, 9 under the one `t480-experimental` adds.
+        #[cfg(not(feature = "t480-experimental"))]
+        const CHROMA_FRAME: [u8; 4] = [14, 100, 14, 103];
+        #[cfg(feature = "t480-experimental")]
+        const CHROMA_FRAME: [u8; 4] = [14, 100, 14, 109];
         let mut latch = fresh(2, 1);
         assert_eq!(latch.observe(&L01), None);
         assert_eq!(latch.observe(&[14, 128, 14, 128]), Some(FOOTROOM));
         assert_eq!(latch.observe(&[14, 128, 14, 128]), None);
-        assert_eq!(latch.observe(&[14, 100, 14, 103]), Some(CHROMA));
-        assert_eq!(latch.observe(&[14, 100, 14, 103]), None);
+        assert_eq!(latch.observe(&CHROMA_FRAME), Some(CHROMA));
+        assert_eq!(latch.observe(&CHROMA_FRAME), None);
         assert_eq!(latch.refusal(), Some(FOOTROOM_AND_CHROMA));
     }
 

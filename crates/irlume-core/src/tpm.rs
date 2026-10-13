@@ -429,19 +429,41 @@ fn srk_template() -> Result<Public> {
 
 /// Read the SHA-256 values for `pcrs` and return them in the same order, stashed
 /// in the envelope so an unseal failure can point at the PCR that shifted.
+///
+/// Also logs the values and the TPM's global `pcrUpdateCounter`. A
+/// `PolicyPCR` session records that counter, so ANY process extending ANY PCR
+/// invalidates an open session; comparing the counter and the bound PCR values
+/// between seal and unseal is what separates a moved counter from a changed PCR
+/// value from a chip that simply refuses the policy. Without this the three are
+/// indistinguishable, because all three arrive as the same
+/// `TPM2_RC_POLICY_FAIL`.
 fn read_pcr_values(ctx: &mut Context, pcrs: &[u32]) -> Result<Vec<PcrValue>> {
     let mut out = Vec::with_capacity(pcrs.len());
     for &p in pcrs {
         let sel = pcr_selection(&[p])?;
-        let (_c, _s, digests) = ctx.pcr_read(sel).map_err(tpm_err)?;
+        let (counter, _s, digests) = ctx.pcr_read(sel).map_err(tpm_err)?;
         let value = digests
             .value()
             .first()
             .map(|d| d.value().to_vec())
             .unwrap_or_default();
+        irlume_common::dlog!(
+            "tpm: seal PCR {p} = {} (pcrUpdateCounter {counter})",
+            crate::tpm::hex_prefix(&value)
+        );
         out.push(PcrValue { pcr: p, value });
     }
     Ok(out)
+}
+
+/// First 16 hex digits of a digest, enough to compare two PCR reads by eye.
+fn hex_prefix(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Run `body` with an auth session of `kind`; flush the session on the way out
@@ -478,6 +500,19 @@ fn with_session<T>(
         .with_decrypt(encrypted)
         .with_encrypt(encrypted)
         .build();
+    // Session shape, logged identically by every leg so seal and unseal can be
+    // compared directly in the journal. The two legs are NOT symmetric today:
+    // the seal leg runs a Trial session with salt=None (encrypted=false) while
+    // the unseal leg runs a Policy session salted with the SRK
+    // (encrypted=true). Both compute against the same `authPolicy`, and
+    // tpm2-tools satisfies the same policy with matching session parameters on
+    // every other host in the fleet, so which side diverges is not derivable
+    // from the code. A differing salt or attribute line here is the signal.
+    #[cfg(feature = "t480-experimental")]
+    irlume_common::dlog!(
+        "tpm: session kind={kind:?} salt={} decrypt={encrypted} encrypt={encrypted} (policy_pcr inputs are independent of both)",
+        if salt.is_some() { "srk" } else { "none" }
+    );
     if let Err(e) = ctx.tr_sess_set_attributes(session, attrs, mask) {
         let _ = ctx.flush_context(SessionHandle::from(session).into());
         return Err(tpm_err(e));
@@ -488,17 +523,69 @@ fn with_session<T>(
     result
 }
 
+/// The TSS response code behind a command error, as `0x...`.
+///
+/// A `Tss2Error` carries the TPM's own response code; every other variant is a
+/// local ESAPI wrapper failure with no TPM code behind it. The distinction
+/// matters when reading a `PolicyPCR` failure: a TPM code names the refusal
+/// (`0x9d` POLICY_FAIL, `0x2c2` PCR, `0x1c4` VALUE), while a wrapper error means
+/// the command never reached the chip.
+fn policy_pcr_response_code(error: &tss_esapi::Error) -> &'static str {
+    use tss_esapi::constants::response_code::Tss2ResponseCodeKind;
+    match error {
+        tss_esapi::Error::Tss2Error(rc) => match rc.kind() {
+            Some(Tss2ResponseCodeKind::PcrChanged) => "PcrChanged",
+            Some(Tss2ResponseCodeKind::PolicyFail) => "PolicyFail",
+            _ => "Tss2Error",
+        },
+        _ => "no TPM response code (ESAPI wrapper error)",
+    }
+}
+
 /// Compute the PolicyPCR digest for a given PCR selection using a trial session.
 /// The digest is what the sealed object commits to.
+///
+/// Kept for every build except `t480-experimental`, whose literal seal computes
+/// the same value in software from live PCR values because that TPM folds zeros
+/// in trial sessions. The `allow(dead_code)` keeps the non-experimental path
+/// compiling there without deleting the function it still needs.
+#[cfg_attr(feature = "t480-experimental", allow(dead_code))]
 fn compute_policy_digest(ctx: &mut Context, pcrs: Option<&PcrSelectionList>) -> Result<Digest> {
     with_session(ctx, None, SessionType::Trial, |ctx, session| {
         if let Some(sel) = pcrs {
             let policy = PolicySession::try_from(session).map_err(tpm_err)?;
-            ctx.policy_pcr(policy, Digest::default(), sel.clone())
-                .map_err(tpm_err)?;
+            // Name the response code on failure. This `?` returns BEFORE the
+            // SEAL digest line below, so a Trial leg that fails here is
+            // indistinguishable from a leg that never ran: the absence of that
+            // line was the only symptom. Log the code explicitly so the failure
+            // says what the TPM answered instead of only what did not happen.
+            if let Err(error) = ctx.policy_pcr(policy, Digest::default(), sel.clone()) {
+                let code = policy_pcr_response_code(&error);
+                irlume_common::dlog!(
+                    "tpm: SEAL policy_pcr in the TRIAL session FAILED ({code}): {error}"
+                );
+                return Err(tpm_err(error));
+            }
         }
         let policy = PolicySession::try_from(session).map_err(tpm_err)?;
-        ctx.policy_get_digest(policy).map_err(tpm_err)
+        let digest = match ctx.policy_get_digest(policy) {
+            Ok(digest) => digest,
+            Err(error) => {
+                irlume_common::dlog!(
+                    "tpm: SEAL policy_get_digest in the TRIAL session FAILED: {error}"
+                );
+                return Err(tpm_err(error));
+            }
+        };
+        // The authPolicy the sealed object commits to. The unseal leg must
+        // arrive at exactly this digest; log it so a mismatch is visible rather
+        // than inferable only from a bare TPM2_RC_POLICY_FAIL.
+        #[cfg(feature = "t480-experimental")]
+        irlume_common::dlog!(
+            "tpm: SEAL authPolicy digest = {}",
+            hex_prefix(digest.value())
+        );
+        Ok(digest)
     })
 }
 
@@ -907,7 +994,29 @@ pub fn seal(secret: &[u8]) -> Result<SealedEnvelope> {
             ),
         }
     }
-    seal_with_pcrs(secret, &policy_pcrs())
+    // The literal PCR tier gets the same round-trip the pcrlock tier gets
+    // above. Without it a seal this TPM cannot honour is returned as if it
+    // were sound and only fails later, at the caller's own unseal, as a bare
+    // TPM2_RC_POLICY_FAIL that names neither this seal nor the PCR that moved.
+    // Verify before trusting it, exactly as the tier above does.
+    let literal = seal_with_pcrs(secret, &policy_pcrs())?;
+    match unseal(&literal) {
+        Ok(rt) if rt.as_slice() == secret => Ok(literal),
+        Ok(_) => {
+            eprintln!("irlume: literal PCR seal round-trip mismatch; refusing to return it");
+            Err(Error::Policy(
+                "the literal PCR seal did not unseal to the sealed secret; enrollment was not \
+                   written"
+                    .into(),
+            ))
+        }
+        Err(e) => {
+            eprintln!("irlume: literal PCR seal doesn't unseal on this boot ({e}); refusing it");
+            Err(Error::Policy(format!(
+                  "the literal PCR seal did not unseal on this boot ({e}); enrollment was not written"
+              )))
+        }
+    }
 }
 
 /// Seal `secret` under a literal `PolicyPCR` over `pcrs` (empty ⇒ no binding:
@@ -919,11 +1028,19 @@ pub fn seal_with_pcrs(secret: &[u8], pcrs: &[u32]) -> Result<SealedEnvelope> {
     let pcr_values = read_pcr_values(&mut ctx, &pcrs)?;
 
     with_srk(&mut ctx, |ctx, srk| {
+        #[cfg_attr(feature = "t480-experimental", allow(unused_variables))]
         let selection = if pcrs.is_empty() {
             None
         } else {
             Some(pcr_selection(&pcrs)?)
         };
+        // `t480-experimental` bypasses the TPM trial session, which on the T480
+        // folds zeros instead of the live PCR digest, and computes the Real
+        // leg's value directly from the values just read. Every other build
+        // keeps the trial session.
+        #[cfg(feature = "t480-experimental")]
+        let policy_digest = literal_auth_policy_from_live_values(&pcrs, &pcr_values)?;
+        #[cfg(not(feature = "t480-experimental"))]
         let policy_digest = compute_policy_digest(ctx, selection.as_ref())?;
         let tmpl = sealed_template(policy_digest)?;
 
@@ -1144,6 +1261,8 @@ fn unseal_literal(env: &SealedEnvelope, mode: SrkMode) -> Result<Zeroizing<Vec<u
 
     with_srk_mode(&mut ctx, mode, |ctx, srk| {
         let public = Public::unmarshall(&env.public).map_err(tpm_err)?;
+        // Captured before `load` consumes `public`.
+        let object_auth_policy = hex_prefix(public.auth_policy().value());
         let private = Private::try_from(env.private.clone()).map_err(tpm_err)?;
 
         let sealed_handle = ctx
@@ -1152,12 +1271,75 @@ fn unseal_literal(env: &SealedEnvelope, mode: SrkMode) -> Result<Zeroizing<Vec<u
 
         // Scoped fallible region so the loaded object is flushed on every exit.
         let result: Result<Zeroizing<Vec<u8>>> = (|| {
+            // Salted with the SRK on every build, as the `with_session` comment
+            // requires: an unsalted session has an empty session key, so the TPM
+            // returns the unseal response in the clear while ESYS still
+            // "decrypts" it, and the caller gets plausible garbage instead of
+            // the secret. A short-lived `t480-experimental` override ran this leg
+            // unsalted on the theory that the salt broke the policy; the two
+            // legs' digests were then observed to MATCH, which disproved that
+            // theory, so the override was reverted rather than left costing bus
+            // encryption of every unseal for nothing.
             with_session(ctx, Some(*srk), SessionType::Policy, |ctx, session| {
                 if !env.pcrs.is_empty() {
                     let sel = pcr_selection(&env.pcrs)?;
+                    // Same counter-and-value line the seal leg logs, so the
+                    // two can be compared directly in the journal. A counter
+                    // that moved means another process extended a PCR; an
+                    // unchanged counter with a changed value means the bound
+                    // PCR itself moved; both unchanged means the chip
+                    // rejected the policy itself.
+                    let (counter, _s, digests) = ctx.pcr_read(sel.clone()).map_err(tpm_err)?;
+                    let value = digests
+                        .value()
+                        .first()
+                        .map(|d| d.value().to_vec())
+                        .unwrap_or_default();
+                    let bound = env
+                        .pcr_values
+                        .iter()
+                        .find(|p| p.pcr == env.pcrs[0])
+                        .map(|p| hex_prefix(&p.value))
+                        .unwrap_or_else(|| "<unstashed>".into());
+                    irlume_common::dlog!(
+                        "tpm: unseal PCR {} = {} (sealed under {}) (pcrUpdateCounter {counter})",
+                        env.pcrs[0],
+                        hex_prefix(&value),
+                        bound
+                    );
+                    // What the OBJECT commits to, beside what this leg
+                    // computes. A mismatch here means the envelope on disk was
+                    // written by a different run or a different code path than
+                    // the one evaluating it now, which is the one failure mode
+                    // that satisfies the policy correctly and is still refused.
+                    irlume_common::dlog!(
+                        "tpm: UNSEAL object authPolicy = {} over PCRs {:?} (envelope policy {:?}, {} stashed PCR value(s))",
+                        object_auth_policy,
+                        env.pcrs,
+                        env.policy,
+                        env.pcr_values.len()
+                    );
                     let policy = PolicySession::try_from(session).map_err(tpm_err)?;
-                    ctx.policy_pcr(policy, Digest::default(), sel)
-                        .map_err(retryable_tpm_err)?;
+                    // Named the same way as the seal leg, so a failure here is
+                    // attributable to the Real session rather than inferred
+                    // from a missing digest line. The retry marker is preserved
+                    // so `is_pcr_changed_race` still classifies a counter race.
+                    if let Err(error) = ctx.policy_pcr(policy, Digest::default(), sel) {
+                        irlume_common::dlog!(
+                            "tpm: UNSEAL policy_pcr in the REAL session FAILED ({}): {error}",
+                            policy_pcr_response_code(&error)
+                        );
+                        return Err(retryable_tpm_err(error));
+                    }
+                    // What this leg's session computed. It must equal the
+                    // `tpm: SEAL authPolicy digest` line from the seal attempt;
+                    // a difference names the defect precisely, and a match means
+                    // the chip refused a policy it had itself computed.
+                    let digest = ctx.policy_get_digest(policy).map_err(tpm_err)?;
+                    irlume_common::dlog!(
+                        "tpm: UNSEAL session digest = {}",
+                        hex_prefix(digest.value())
+                    );
                 }
                 let data = ctx
                     .execute_with_session(Some(session), |ctx| ctx.unseal(sealed_handle.into()))
@@ -1697,6 +1879,60 @@ fn marshal_pcr_selection(pcrs: &[u32]) -> Vec<u8> {
     out.push(bitmap.len() as u8);
     out.extend_from_slice(&bitmap);
     out
+}
+
+/// The literal-PCR `authPolicy` from live PCR values, without a TPM trial session.
+///
+/// Part 3 §23.7 eq. 20 is `policyDigest_new := H(policyDigest_old ||
+/// TPM_CC_PolicyPCR || pcrs || pcrDigest)`. A Real session with an Empty Buffer
+/// reads the PCRs and folds their composite digest; a Trial session on the T480
+/// folds zeros instead, so the two legs diverge even with identical PCR values
+/// and an identical `pcrUpdateCounter`. Identical values and counter 688 with
+/// digests `e987c3a4` (trial) vs `15e690b1` (real) proved the divergence is in
+/// the digest construction, not a race.
+///
+/// This computes the Real leg's value directly: the composite digest of the
+/// live values just read from this TPM (`pcr_composite_digest`), folded with
+/// `policy_pcr_digest` from a zero initial digest. The result must equal what
+/// the Real session computes, which the UNSEAL digest line verifies. No weaker
+/// binding results: the policy still commits to exactly these PCRs at exactly
+/// these values, read live from this TPM moments ago.
+///
+/// `t480-experimental` only. Every other build keeps the trial session.
+#[cfg(feature = "t480-experimental")]
+fn literal_auth_policy_from_live_values(
+    pcrs: &[u32],
+    pcr_values: &[crate::envelope::PcrValue],
+) -> Result<Digest> {
+    use std::convert::TryInto;
+    if pcrs.is_empty() {
+        return Digest::try_from(vec![0u8; 32]).map_err(tpm_err);
+    }
+    if pcr_values.len() != pcrs.len() {
+        return Err(Error::Tpm(format!(
+            "PCR value count {} does not match selection len {}",
+            pcr_values.len(),
+            pcrs.len()
+        )));
+    }
+    let mut arrays: Vec<[u8; 32]> = Vec::with_capacity(pcr_values.len());
+    for v in pcr_values {
+        let arr: [u8; 32] = v
+            .value
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Tpm(format!("PCR {} value is not 32 bytes", v.pcr)))?;
+        arrays.push(arr);
+    }
+    let composite = pcr_composite_digest(&arrays)?;
+    let zero = Digest::try_from(vec![0u8; 32]).map_err(tpm_err)?;
+    let policy = policy_pcr_digest(&zero, pcrs, &composite)?;
+    irlume_common::dlog!(
+        "tpm: SEAL authPolicy digest = {} (software composite over {} live PCR value(s))",
+        hex_prefix(policy.value()),
+        arrays.len()
+    );
+    Ok(policy)
 }
 
 /// `TPM2_PolicyPCR`'s effect on a policy digest, computed without a TPM.
@@ -2522,6 +2758,45 @@ UV+HrKUsvUeCjP7HZkREwl0xt89H9c1TiNQqTpXicwE4D1NeDA5ountiSQ==
         // Default when unset is PCR 7.
         std::env::remove_var("IRLUME_PCRS");
         assert_eq!(policy_pcrs(), vec![7]);
+    }
+
+    /// The experimental literal seal commits to the live PCR digest, not to
+    /// zeros. A Trial session on the T480 folds zeros (`e987c3a4…`) while the
+    /// Real session folds the live composite (`15e690b1…`); this asserts the
+    /// software path produces the latter shape, never the former.
+    #[cfg(feature = "t480-experimental")]
+    #[test]
+    fn experimental_literal_policy_commits_to_live_pcrs_not_zeros() {
+        use crate::envelope::PcrValue;
+        // Empty selection binds nothing: the zero digest.
+        let empty = literal_auth_policy_from_live_values(&[], &[]).unwrap();
+        assert_eq!(empty.value(), &[0u8; 32]);
+        // One live PCR 7 value: deterministic, non-zero, and equal to folding
+        // its composite by hand.
+        let values = vec![PcrValue {
+            pcr: 7,
+            value: vec![0xAB; 32],
+        }];
+        let got = literal_auth_policy_from_live_values(&[7], &values).unwrap();
+        let zero = Digest::try_from(vec![0u8; 32]).unwrap();
+        let composite = pcr_composite_digest(&[[0xAB; 32]]).unwrap();
+        let want = policy_pcr_digest(&zero, &[7], &composite).unwrap();
+        assert_eq!(got.value(), want.value());
+        // And it must NOT equal the zero-folded value a buggy trial produces.
+        let zero_folded = policy_pcr_digest(&zero, &[7], &zero).unwrap();
+        assert_ne!(
+            got.value(),
+            zero_folded.value(),
+            "the experimental seal must not fold zeros"
+        );
+        // Mismatched counts and short values are refused, not silently hashed.
+        let mismatch = literal_auth_policy_from_live_values(&[7], &[]);
+        assert!(mismatch.is_err());
+        let short = vec![PcrValue {
+            pcr: 7,
+            value: vec![0xAB; 16],
+        }];
+        assert!(literal_auth_policy_from_live_values(&[7], &short).is_err());
     }
 
     /// Each PCR once, in the order first given; what does not parse is

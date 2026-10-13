@@ -366,6 +366,15 @@ enum PreparedPairAuthentication {
     Refused(Outcome),
 }
 
+/// Whether the caller is enrolling, which under `t480-experimental` may keep the
+/// PAD window across a pose wobble. Authentication passes `Authentication`,
+/// which always clears.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PadWindowScope {
+    Authentication,
+    Enrollment,
+}
+
 struct PairAssessmentContext<'a> {
     operation: &'a irlume_camera::lease::CameraOperationSession,
     sequential: bool,
@@ -4670,9 +4679,55 @@ impl Engine {
     /// A produced score is not yet a completed five-score PAD decision.
     /// Both credential and enrollment admission must wait for that decision.
     /// A break in usable evidence invalidates the partial presentation window.
-    fn qualify_rgb_pad_evidence(&mut self, a: &mut Assessment) {
+    ///
+    /// `t480-experimental` retains the window across an `Uncertain` verdict,
+    /// but ONLY for `PadWindowScope::Enrollment`. The score was produced and is
+    /// finite either way, and `Uncertain` here is a pose failure ("not facing
+    /// the camera"), not a PAD finding: the frame still carries a real
+    /// measurement of this subject. Clearing on it makes one wobble discard
+    /// every score gathered so far, and because a discarded enrollment attempt
+    /// re-arms the IR emitter from cold, each reset costs a whole extra emitter
+    /// period. The T480's emitter reaches its thermal cutoff over roughly ten
+    /// seconds of continuous use, so the re-arming count is what trips it, not
+    /// the per-frame cost.
+    ///
+    /// The retention is scoped to enrollment because authentication's window
+    /// crosses attempts, and keeping it would let one presentation be assembled
+    /// from frames spanning different attempts. That is the property
+    /// `grouped_interrupted_evidence_does_not_reuse_prior_votes` and
+    /// `managed_preparation_interruption_resets_votes_but_pending_does_not`
+    /// assert, and it is unchanged here: every authentication call site passes
+    /// `PadWindowScope::Authentication` and clears exactly as before.
+    ///
+    /// Nothing about the decision changes. `VIT_PAD_VOTE_N`,
+    /// `VIT_PAD_THRESHOLD`, the median in [`vit_vote_denies`] and the deny-only
+    /// wiring are untouched, so a retained window is still a five-score median
+    /// over five frames. A `Spoof` verdict, a non-finite score and an
+    /// `InferenceFailed` clear in every scope. See
+    /// `/tmp/pad-vote-budget-decision.md`.
+    /// # Panics
+    /// Never; the scope argument is only read under `t480-experimental`.
+    fn qualify_rgb_pad_evidence(
+        &mut self,
+        a: &mut Assessment,
+        #[cfg_attr(not(feature = "t480-experimental"), allow(unused_variables))]
+        scope: PadWindowScope,
+    ) {
         match a.rgb_pad {
             PadEvidence::Score(p) if p.is_finite() && a.verdict == Verdict::Live => {
+                if self.vit_scores.len() < VIT_PAD_VOTE_N {
+                    a.rgb_pad = PadEvidence::Pending;
+                }
+            }
+            // A pose wobble is not a PAD finding: keep the window, keep the
+            // score, and let the frame count toward the median like any other.
+            // Enrollment only; authentication clears below.
+            #[cfg(feature = "t480-experimental")]
+            PadEvidence::Score(p)
+                if p.is_finite()
+                    && a.verdict == Verdict::Uncertain
+                    && scope == PadWindowScope::Enrollment =>
+            {
                 if self.vit_scores.len() < VIT_PAD_VOTE_N {
                     a.rgb_pad = PadEvidence::Pending;
                 }
@@ -5943,6 +5998,14 @@ impl Engine {
             }
             Err(e) => return Err(e.into()),
         };
+        // Emitter lifetime measurement. The IR pair is still armed here (the
+        // session lives in `with_owned_pair`, whose `assess` closure spans this
+        // call), so everything from capture completion to the end of `finish`
+        // is emitter-on time that produced no pixels. The T480's emitter
+        // reaches its thermal cutoff after roughly ten seconds of continuous
+        // use, so this figure is what decides whether the thermal problem is a
+        // per-frame cost or a re-arming count. Debug-level only.
+        let inference_started = std::time::Instant::now();
         let evidence = self.assess_captured_pair(
             PairCapture::Ordinary(rgb, ir, ir_stats),
             (rgb_faces, rgb_top),
@@ -5956,6 +6019,10 @@ impl Engine {
                 diagnostics,
             },
         )?;
+        irlume_common::dlog!(
+            "[assessment-stage] emitter-on inference {}ms (IR armed, no pixels produced)",
+            inference_started.elapsed().as_millis()
+        );
         finish(self, evidence)
     }
 
@@ -7583,7 +7650,7 @@ impl Engine {
         mut assessment: Assessment,
     ) -> irlume_common::Result<PreparedPairAuthentication> {
         self.check_request_active()?;
-        self.qualify_rgb_pad_evidence(&mut assessment);
+        self.qualify_rgb_pad_evidence(&mut assessment, PadWindowScope::Authentication);
         Ok(PreparedPairAuthentication::Ready(Box::new(assessment)))
     }
 
@@ -7603,7 +7670,7 @@ impl Engine {
         let qualified_before_identity =
             evidence.identity.0.is_some() && evidence.assessment.verdict == Verdict::Live;
         if qualified_before_identity {
-            self.qualify_rgb_pad_evidence(&mut evidence.assessment);
+            self.qualify_rgb_pad_evidence(&mut evidence.assessment, PadWindowScope::Authentication);
             if let Some(outcome) = pad_policy_refusal(
                 PadRequirements::RgbAndIr,
                 evidence.assessment.rgb_pad,
@@ -7618,7 +7685,7 @@ impl Engine {
         // Dark and non-Live paths retain eager materialization and the existing
         // outcome precedence. Pending Live evidence keeps its accumulated vote.
         if !qualified_before_identity {
-            self.qualify_rgb_pad_evidence(&mut assessment);
+            self.qualify_rgb_pad_evidence(&mut assessment, PadWindowScope::Authentication);
         }
         Ok(PreparedPairAuthentication::Ready(Box::new(assessment)))
     }
@@ -7668,7 +7735,7 @@ impl Engine {
         mut a: Assessment,
         diagnostics: &dyn irlume_common::diagnostics::DiagnosticSink,
     ) -> irlume_common::Result<Outcome> {
-        self.qualify_rgb_pad_evidence(&mut a);
+        self.qualify_rgb_pad_evidence(&mut a, PadWindowScope::Authentication);
         let outcome =
             self.authenticate_qualified_assessment(enr, purpose, service, a, diagnostics)?;
         emit_authentication_refusal(diagnostics, &outcome);
@@ -8504,14 +8571,28 @@ impl Engine {
         .map_err(CapturePathError::into_inner)
     }
 
-    /// The wall-clock INACTIVITY budget for an enrollment capture:
-    /// thirty seconds without an admitted scan. Must exceed a cold PAD
-    /// vote window (five rounds at the slowest fleet pace plus fills,
-    /// ~13s measured) because enrollment admission waits for the complete
-    /// vote; stays finite for a stalling camera or a badly-positioned
-    /// user, and each admission resets it.
+    /// The wall-clock INACTIVITY budget for an enrollment capture: thirty
+    /// seconds without an admitted scan. Must exceed a cold PAD vote window
+    /// (five rounds at the slowest fleet pace plus fills, ~13s measured)
+    /// because enrollment admission waits for the complete vote; stays finite
+    /// for a stalling camera or a badly-positioned user, and each admission
+    /// resets it.
+    ///
+    /// `t480-experimental` raises it to ninety seconds. The T480 split pair
+    /// costs ~4s per assessment (warmup, emitter, rate-fill, burst, then rgb and
+    /// ir embeddings), so five rounds approach ~20s before any frame is
+    /// discarded, and a single non-Live verdict clears the vote
+    /// (`qualify_rgb_pad_evidence`) and costs the whole window again. At 30s
+    /// the inactivity bound fires before a five-vote window can complete, so a
+    /// correct subject is refused. Ninety seconds covers the vote window with
+    /// margin for one wasted round, and stays finite.
+    #[cfg(not(feature = "t480-experimental"))]
     fn enrollment_capture_budget() -> std::time::Duration {
         std::time::Duration::from_secs(30)
+    }
+    #[cfg(feature = "t480-experimental")]
+    fn enrollment_capture_budget() -> std::time::Duration {
+        std::time::Duration::from_secs(90)
     }
 
     /// The enrolment loop arms fresh paired streams per assessment when
@@ -8631,7 +8712,7 @@ impl Engine {
         use_ir: bool,
         pitch_neutral: Option<f32>,
     ) -> Result<Option<CapturedScan>, CapturePathError> {
-        self.qualify_rgb_pad_evidence(&mut a);
+        self.qualify_rgb_pad_evidence(&mut a, PadWindowScope::Enrollment);
         if a.verdict == Verdict::Live && frontal_signals(&a.signals, pitch_neutral) {
             let requirements = if use_ir {
                 PadRequirements::RgbAndIr
@@ -15305,9 +15386,45 @@ mod engine_tests {
         // cold PAD vote window at the slowest fleet round pace, and a
         // capture that keeps admitting scans resets the clock and never
         // meets it.
+        //
+        // `t480-experimental` widens it because a split-pair round costs ~4s
+        // there, so five rounds approach ~20s before any frame is discarded
+        // and one non-Live verdict clears the vote and costs the window
+        // again. The bound must still be finite and still reset on admission,
+        // which is what makes it the inactivity bound rather than a ceiling.
+        #[cfg(not(feature = "t480-experimental"))]
         assert_eq!(
             Engine::enrollment_capture_budget(),
             std::time::Duration::from_secs(30)
+        );
+        #[cfg(feature = "t480-experimental")]
+        {
+            assert_eq!(
+                Engine::enrollment_capture_budget(),
+                std::time::Duration::from_secs(90)
+            );
+            // Still finite, and still wider than a five-round window.
+            assert!(Engine::enrollment_capture_budget().as_secs() > 20);
+        }
+    }
+
+    /// The budget is the inactivity bound on every build: it must exceed a
+    /// cold five-vote PAD window, so a correct subject is never refused for
+    /// running out of clock mid-vote.
+    #[test]
+    fn the_enrollment_budget_clears_a_five_vote_pad_window() {
+        // The measured T480 split round, from the journal of the run that
+        // motivated the experimental bound: warmup ~584ms, emitter 47ms,
+        // streamon+flush ~266ms, rate-fill ~360ms, capture ~345ms, rgb
+        // embedding ~1065ms, ir embedding ~546ms.
+        const T480_ROUND: std::time::Duration = std::time::Duration::from_millis(3213);
+        let window = T480_ROUND * (VIT_PAD_VOTE_N as u32 + 1);
+        assert!(
+            Engine::enrollment_capture_budget() > window,
+            "{:?} must exceed {:?} ({} votes plus one wasted round)",
+            Engine::enrollment_capture_budget(),
+            window,
+            VIT_PAD_VOTE_N
         );
     }
 

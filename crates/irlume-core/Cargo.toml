@@ -11,6 +11,10 @@ default = []
 # answers. Resolver 2 keeps it out of release builds, so no production binary
 # ships the override.
 test-support = []
+  # The T480's TPM evaluation of a literal PolicyPCR: session-shape diagnostics
+  # in `tpm`, and an unsalted unseal session that matches the seal leg. Never
+  # enabled on a default build; see the `with_session` salt comment in `tpm.rs`.
+  t480-experimental = []
 
 [dependencies]
 irlume-common.workspace = true

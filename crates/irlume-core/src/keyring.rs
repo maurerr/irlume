@@ -433,6 +433,14 @@ fn unseal_secret_as(user: &str, account: &mut Account<'_>) -> Result<Unsealed> {
     let env = SealedEnvelope::load(&path)?;
     account.require(record_for(env.secret), env.uid)?;
     let kind = env.secret;
+    // Name the envelope before the TPM sees it. `tpm::unseal` logs the policy
+    // legs but nothing said WHICH envelope they belong to, so a keyring token,
+    // a login password and a template key were indistinguishable in the journal
+    // even though each is a separate file with a separate policy.
+    irlume_common::dlog!(
+        "tpm: unsealing keyring envelope kind={kind:?} for '{user}' from {}",
+        path.display()
+    );
     Ok(Unsealed {
         secret: tpm::unseal(&env)?,
         kind,

@@ -7515,23 +7515,23 @@ impl IrSession<'_> {
         // `the_yuyv_content_latch_lives_on_the_session_and_outlits_recovery`
         // guard pins the lines that name `content`, and a second read would
         // change that list.
-        let d1_observations: Vec<(u32, f32)> = means
-            .iter()
-            .zip(&dequeue_evidence)
-            .map(|(&mean, ev)| (ev.1.raw(), mean as f32))
-            .collect();
         // The single read of the session latch, at the indentation and text the
-        // content-latch guard pins. `d1_qualify` hands the value back so the
-        // debug line can report it without reading the latch a second time.
+        // content-latch guard pins. `derive_d1_illumination_from` hands the
+        // latch value back so the debug line can report it without reading the
+        // latch a second time. The observation list is built inside the cfg
+        // block so the default build does not compute a value it never reads.
         #[cfg(feature = "t480-experimental")]
         let d1 = {
-            #[cfg(feature = "t480-experimental")]
-            let derivation = derive_d1_illumination_from(
+            let d1_observations: Vec<(u32, f32)> = means
+                .iter()
+                .zip(&dequeue_evidence)
+                .map(|(&mean, ev)| (ev.1.raw(), mean as f32))
+                .collect();
+            derive_d1_illumination_from(
                 self.cam.format_evidence.is_some(),
                 content.as_ref().is_some_and(|l| l.refusal().is_none()),
                 &d1_observations,
-            );
-            derivation
+            )
         };
         let white_level = {
             #[cfg(feature = "t480-experimental")]

@@ -8356,8 +8356,17 @@ fn dispatch_scoped_session_inner(
         // Past every gate, the dedicated Engine split entry runs on this
         // retained scope. Never lower these requests to an ordinary operation
         // or to `dispatch_after_authorization`, whose backstop refuses both.
-        let response = split_enrollment_handler(&req, peer, &mut camera_request, scope);
-        return split_reply_for_peer(&req, response, peer.uid);
+let response = split_enrollment_handler(&req, peer, &mut camera_request, scope);
+            // split_reply_for_peer replaces every non-Enrolled reply for a
+            // non-root peer with one fixed string (ADR-0032 section 6), so the
+            // Engine's own reason is lost with no trace of it. Journal it here,
+            // at the one point where it still exists. Text is share-safe by
+            // construction: the Engine's deny reasons carry no score, no
+            // biometric measure and no raw device text (ADR-0030).
+            if let Response::Error(reason) = &response {
+                jout_err!("irlumed: split enrollment failed: {reason}");
+            }
+            return split_reply_for_peer(&req, response, peer.uid);
     }
     if let Request::EnrollOn { pair, .. } | Request::AddCameraGroupOn { pair, .. } = &req {
         let mut camera_request = match engine.prepare_enrollment_camera(pair) {
